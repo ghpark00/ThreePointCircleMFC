@@ -8,6 +8,8 @@
 #include "ThreePointCircleMFCDlg.h"
 #include "afxdialogex.h"
 
+#include <cstdint>
+
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #endif
@@ -65,6 +67,9 @@ BEGIN_MESSAGE_MAP(CThreePointCircleMFCDlg, CDialogEx)
 	ON_WM_SYSCOMMAND()
 	ON_WM_PAINT()
 	ON_WM_QUERYDRAGICON()
+	ON_BN_CLICKED(IDC_BUTTON_APPLY_SETTINGS, &CThreePointCircleMFCDlg::OnBnClickedApplySettings)
+	ON_BN_CLICKED(IDC_BUTTON_RESET, &CThreePointCircleMFCDlg::OnBnClickedReset)
+	ON_MESSAGE(WM_APP_CANVAS_EVENT, &CThreePointCircleMFCDlg::OnCanvasEvent)
 END_MESSAGE_MAP()
 
 
@@ -99,9 +104,28 @@ BOOL CThreePointCircleMFCDlg::OnInitDialog()
 	SetIcon(m_hIcon, TRUE);			// 큰 아이콘을 설정합니다.
 	SetIcon(m_hIcon, FALSE);		// 작은 아이콘을 설정합니다.
 
-	// TODO: 여기에 추가 초기화 작업을 추가합니다.
+	if (!m_canvas.AttachCanvas(this, IDC_CANVAS_PLACEHOLDER))
+	{
+		AfxMessageBox(_T("8-bit CImage 캔버스를 만들지 못했습니다."), MB_OK | MB_ICONERROR);
+		EndDialog(IDCANCEL);
+		return FALSE;
+	}
+
+	SendDlgItemMessage(IDC_EDIT_POINT_RADIUS, EM_SETLIMITTEXT, 10, 0);
+	SendDlgItemMessage(IDC_EDIT_OUTLINE_THICKNESS, EM_SETLIMITTEXT, 10, 0);
+
+	UpdateSettingEdits();
+	UpdateCoordinateLabels();
+	SetStatusText(_T("클릭점 0/3\r\n캔버스를 클릭하세요."));
+	GetDlgItem(IDC_BUTTON_RANDOM_MOVE)->EnableWindow(FALSE);
 
 	return TRUE;  // 포커스를 컨트롤에 설정하지 않으면 TRUE를 반환합니다.
+}
+
+void CThreePointCircleMFCDlg::OnOK()
+{
+	// Enter applies the settings but never closes the dialog unexpectedly.
+	OnBnClickedApplySettings();
 }
 
 void CThreePointCircleMFCDlg::OnSysCommand(UINT nID, LPARAM lParam)
@@ -151,5 +175,155 @@ void CThreePointCircleMFCDlg::OnPaint()
 HCURSOR CThreePointCircleMFCDlg::OnQueryDragIcon()
 {
 	return static_cast<HCURSOR>(m_hIcon);
+}
+
+void CThreePointCircleMFCDlg::OnBnClickedApplySettings()
+{
+	CString radiusText;
+	CString thicknessText;
+	GetDlgItemText(IDC_EDIT_POINT_RADIUS, radiusText);
+	GetDlgItemText(IDC_EDIT_OUTLINE_THICKNESS, thicknessText);
+
+	int radius = 0;
+	int thickness = 0;
+	const bool radiusIsValid = ParsePositiveInteger(
+		radiusText, kMinimumPointRadius, kMaximumPointRadius, radius);
+	const bool thicknessIsValid = ParsePositiveInteger(
+		thicknessText, kMinimumOutlineThickness, kMaximumOutlineThickness, thickness);
+
+	if (!radiusIsValid || !thicknessIsValid)
+	{
+		CString message(_T("설정을 적용하지 않았습니다. 기존 유효한 설정을 유지합니다.\r\n\r\n"));
+		if (!radiusIsValid)
+		{
+			message += _T("- 클릭점 반지름: 1~100 사이의 정수를 입력하세요.\r\n");
+		}
+		if (!thicknessIsValid)
+		{
+			message += _T("- 외접원 선 두께: 1~50 사이의 정수를 입력하세요.");
+		}
+		AfxMessageBox(message, MB_OK | MB_ICONWARNING);
+		SetStatusText(_T("설정 오류\r\n기존 설정을 유지합니다."));
+		GetDlgItem(!radiusIsValid ? IDC_EDIT_POINT_RADIUS :
+			IDC_EDIT_OUTLINE_THICKNESS)->SetFocus();
+		return;
+	}
+
+	m_pointRadius = radius;
+	m_outlineThickness = thickness;
+	m_canvas.SetPointRadius(m_pointRadius);
+	UpdateSettingEdits();
+
+	CString status;
+	status.Format(_T("클릭점 %d/3\r\n설정 적용: 반지름 %d, 두께 %d"),
+		m_canvas.GetPointCount(), m_pointRadius, m_outlineThickness);
+	SetStatusText(status);
+}
+
+void CThreePointCircleMFCDlg::OnBnClickedReset()
+{
+	m_canvas.ResetPoints();
+	UpdateCoordinateLabels();
+	UpdateSettingEdits();
+	SetStatusText(_T("클릭점 0/3\r\n캔버스를 클릭하세요."));
+}
+
+LRESULT CThreePointCircleMFCDlg::OnCanvasEvent(WPARAM wParam, LPARAM /*lParam*/)
+{
+	const CanvasEvent event = static_cast<CanvasEvent>(wParam);
+	if (event == CanvasEvent::PointsChanged)
+	{
+		UpdateCoordinateLabels();
+		CString status;
+		const int pointCount = m_canvas.GetPointCount();
+		if (pointCount < CCanvasWnd::kMaxPointCount)
+		{
+			status.Format(_T("클릭점 %d/3\r\n다음 점을 입력하세요."), pointCount);
+		}
+		else
+		{
+			status = _T("클릭점 3/3\r\n세 점 입력이 완료되었습니다.");
+		}
+		SetStatusText(status);
+	}
+	else if (event == CanvasEvent::PointLimitReached)
+	{
+		SetStatusText(_T("클릭점 3/3\r\n더 이상 추가할 수 없습니다."));
+	}
+	else if (event == CanvasEvent::ExistingPointPressed)
+	{
+		SetStatusText(_T("클릭점 3/3\r\n드래그는 다음 단계에서 지원합니다."));
+	}
+	return 0;
+}
+
+bool CThreePointCircleMFCDlg::ParsePositiveInteger(const CString& text,
+	int minimum, int maximum, int& value) noexcept
+{
+	if (text.IsEmpty())
+	{
+		return false;
+	}
+
+	std::uint64_t parsed = 0;
+	for (int index = 0; index < text.GetLength(); ++index)
+	{
+		const wchar_t character = text[index];
+		if (character < L'0' || character > L'9')
+		{
+			return false;
+		}
+
+		parsed = parsed * 10 + static_cast<unsigned int>(character - L'0');
+		if (parsed > static_cast<std::uint64_t>(maximum))
+		{
+			return false;
+		}
+	}
+
+	if (parsed < static_cast<std::uint64_t>(minimum))
+	{
+		return false;
+	}
+
+	value = static_cast<int>(parsed);
+	return true;
+}
+
+void CThreePointCircleMFCDlg::UpdateCoordinateLabels()
+{
+	const UINT labelIds[CCanvasWnd::kMaxPointCount] =
+	{
+		IDC_STATIC_P1,
+		IDC_STATIC_P2,
+		IDC_STATIC_P3
+	};
+
+	for (int index = 0; index < CCanvasWnd::kMaxPointCount; ++index)
+	{
+		CString text;
+		CPoint point;
+		if (m_canvas.GetPoint(index, point))
+		{
+			text.Format(_T("P%d: X = %d, Y = %d"), index + 1, point.x, point.y);
+		}
+		else
+		{
+			text.Format(_T("P%d: 미입력"), index + 1);
+		}
+		SetDlgItemText(labelIds[index], text);
+	}
+}
+
+void CThreePointCircleMFCDlg::UpdateSettingEdits()
+{
+	SetDlgItemInt(IDC_EDIT_POINT_RADIUS, static_cast<UINT>(m_pointRadius), FALSE);
+	SetDlgItemInt(IDC_EDIT_OUTLINE_THICKNESS,
+		static_cast<UINT>(m_outlineThickness), FALSE);
+}
+
+void CThreePointCircleMFCDlg::SetStatusText(const CString& text)
+{
+	SetDlgItemText(IDC_STATIC_STATUS, text);
 }
 

@@ -8,3 +8,12 @@ x86/
 *.db
 *.opendb
 *.VC.db
+*.suo
+*.ipch
+ipch/
+*.obj
+*.pdb
+*.ilk
+*.tlog
+*.lastbuildstate
+*.tmp
