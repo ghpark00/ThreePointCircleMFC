@@ -79,6 +79,10 @@ BOOL CThreePointCircleMFCDlg::OnInitDialog()
 {
 	CDialogEx::OnInitDialog();
 
+#ifdef _DEBUG
+	ASSERT(CircleGeometry::RunDebugVerification());
+#endif
+
 	// 시스템 메뉴에 "정보..." 메뉴 항목을 추가합니다.
 
 	// IDM_ABOUTBOX는 시스템 명령 범위에 있어야 합니다.
@@ -117,7 +121,6 @@ BOOL CThreePointCircleMFCDlg::OnInitDialog()
 	UpdateSettingEdits();
 	UpdateCoordinateLabels();
 	SetStatusText(_T("클릭점 0/3\r\n캔버스를 클릭하세요."));
-	GetDlgItem(IDC_BUTTON_RANDOM_MOVE)->EnableWindow(FALSE);
 
 	return TRUE;  // 포커스를 컨트롤에 설정하지 않으면 TRUE를 반환합니다.
 }
@@ -204,15 +207,21 @@ void CThreePointCircleMFCDlg::OnBnClickedApplySettings()
 		}
 		AfxMessageBox(message, MB_OK | MB_ICONWARNING);
 		SetStatusText(_T("설정 오류\r\n기존 설정을 유지합니다."));
-		GetDlgItem(!radiusIsValid ? IDC_EDIT_POINT_RADIUS :
-			IDC_EDIT_OUTLINE_THICKNESS)->SetFocus();
+		::SetFocus(::GetDlgItem(GetSafeHwnd(), !radiusIsValid ?
+			IDC_EDIT_POINT_RADIUS : IDC_EDIT_OUTLINE_THICKNESS));
 		return;
 	}
 
 	m_pointRadius = radius;
 	m_outlineThickness = thickness;
-	m_canvas.SetPointRadius(m_pointRadius);
+	m_canvas.SetRenderSettings(m_pointRadius, m_outlineThickness);
 	UpdateSettingEdits();
+
+	if (m_canvas.GetPointCount() == CCanvasWnd::kMaxPointCount)
+	{
+		UpdateCanvasStatus();
+		return;
+	}
 
 	CString status;
 	status.Format(_T("클릭점 %d/3\r\n설정 적용: 반지름 %d, 두께 %d"),
@@ -234,17 +243,7 @@ LRESULT CThreePointCircleMFCDlg::OnCanvasEvent(WPARAM wParam, LPARAM /*lParam*/)
 	if (event == CanvasEvent::PointsChanged)
 	{
 		UpdateCoordinateLabels();
-		CString status;
-		const int pointCount = m_canvas.GetPointCount();
-		if (pointCount < CCanvasWnd::kMaxPointCount)
-		{
-			status.Format(_T("클릭점 %d/3\r\n다음 점을 입력하세요."), pointCount);
-		}
-		else
-		{
-			status = _T("클릭점 3/3\r\n세 점 입력이 완료되었습니다.");
-		}
-		SetStatusText(status);
+		UpdateCanvasStatus();
 	}
 	else if (event == CanvasEvent::PointLimitReached)
 	{
@@ -320,6 +319,41 @@ void CThreePointCircleMFCDlg::UpdateSettingEdits()
 	SetDlgItemInt(IDC_EDIT_POINT_RADIUS, static_cast<UINT>(m_pointRadius), FALSE);
 	SetDlgItemInt(IDC_EDIT_OUTLINE_THICKNESS,
 		static_cast<UINT>(m_outlineThickness), FALSE);
+}
+
+void CThreePointCircleMFCDlg::UpdateCanvasStatus()
+{
+	const int pointCount = m_canvas.GetPointCount();
+	if (pointCount < CCanvasWnd::kMaxPointCount)
+	{
+		CString status;
+		status.Format(_T("클릭점 %d/3\r\n다음 점을 입력하세요."), pointCount);
+		SetStatusText(status);
+		return;
+	}
+
+	CircleGeometry::Circumcircle circle;
+	if (m_canvas.GetCircumcircle(circle))
+	{
+		CString status;
+		status.Format(_T("외접원 생성 완료\r\n중심 (%.2f, %.2f), 반지름 %.2f"),
+			circle.centerX, circle.centerY, circle.radius);
+		SetStatusText(status);
+		return;
+	}
+
+	switch (m_canvas.GetCircumcircleError())
+	{
+	case CircleGeometry::CircumcircleError::DuplicatePoints:
+		SetStatusText(_T("중복된 클릭점이 있어\r\n외접원을 계산할 수 없습니다."));
+		break;
+	case CircleGeometry::CircumcircleError::CollinearPoints:
+		SetStatusText(_T("세 점이 일직선이어서\r\n외접원을 계산할 수 없습니다."));
+		break;
+	default:
+		SetStatusText(_T("수치적으로 불안정하여\r\n외접원을 계산할 수 없습니다."));
+		break;
+	}
 }
 
 void CThreePointCircleMFCDlg::SetStatusText(const CString& text)

@@ -31,14 +31,15 @@ BOOL CCanvasWnd::AttachCanvas(CWnd* parent, UINT controlId)
 	return TRUE;
 }
 
-void CCanvasWnd::SetPointRadius(int radius)
+void CCanvasWnd::SetRenderSettings(int pointRadius, int outlineThickness)
 {
-	if (radius == m_pointRadius)
+	if (pointRadius == m_pointRadius && outlineThickness == m_outlineThickness)
 	{
 		return;
 	}
 
-	m_pointRadius = radius;
+	m_pointRadius = pointRadius;
+	m_outlineThickness = outlineThickness;
 	RenderScene();
 	Invalidate(FALSE);
 }
@@ -46,6 +47,8 @@ void CCanvasWnd::SetPointRadius(int radius)
 void CCanvasWnd::ResetPoints()
 {
 	m_pointCount = 0;
+	m_circumcircle.reset();
+	m_circumcircleError = CircleGeometry::CircumcircleError::None;
 	RenderScene();
 	Invalidate(FALSE);
 }
@@ -64,6 +67,22 @@ bool CCanvasWnd::GetPoint(int index, CPoint& point) const noexcept
 
 	point = m_points[static_cast<std::size_t>(index)];
 	return true;
+}
+
+bool CCanvasWnd::GetCircumcircle(CircleGeometry::Circumcircle& circle) const noexcept
+{
+	if (!m_circumcircle.has_value())
+	{
+		return false;
+	}
+
+	circle = *m_circumcircle;
+	return true;
+}
+
+CircleGeometry::CircumcircleError CCanvasWnd::GetCircumcircleError() const noexcept
+{
+	return m_circumcircleError;
 }
 
 void CCanvasWnd::OnPaint()
@@ -119,6 +138,7 @@ void CCanvasWnd::OnLButtonDown(UINT flags, CPoint point)
 
 	m_points[static_cast<std::size_t>(m_pointCount)] = point;
 	++m_pointCount;
+	RecalculateCircumcircle();
 	RenderScene();
 	Invalidate(FALSE);
 	NotifyParent(CanvasEvent::PointsChanged);
@@ -173,11 +193,42 @@ bool CCanvasWnd::RecreateImage(int width, int height)
 	return true;
 }
 
+void CCanvasWnd::RecalculateCircumcircle()
+{
+	m_circumcircle.reset();
+	m_circumcircleError = CircleGeometry::CircumcircleError::None;
+	if (m_pointCount != kMaxPointCount)
+	{
+		return;
+	}
+
+	const CPoint& first = m_points[0];
+	const CPoint& second = m_points[1];
+	const CPoint& third = m_points[2];
+	const CircleGeometry::CircumcircleResult result =
+		CircleGeometry::CalculateCircumcircle(
+			{ static_cast<double>(first.x), static_cast<double>(first.y) },
+			{ static_cast<double>(second.x), static_cast<double>(second.y) },
+			{ static_cast<double>(third.x), static_cast<double>(third.y) });
+	m_circumcircleError = result.error;
+	if (result.IsValid())
+	{
+		m_circumcircle = result.circle;
+	}
+}
+
 void CCanvasWnd::RenderScene()
 {
 	if (!PixelRenderer::ClearGrayscale(m_image, 255))
 	{
 		return;
+	}
+
+	if (m_circumcircle.has_value())
+	{
+		PixelRenderer::DrawCircleOutline(m_image,
+			m_circumcircle->centerX, m_circumcircle->centerY,
+			m_circumcircle->radius, m_outlineThickness, 0);
 	}
 
 	for (int index = 0; index < m_pointCount; ++index)
@@ -207,9 +258,10 @@ int CCanvasWnd::HitTestPoint(CPoint point) const noexcept
 
 void CCanvasWnd::NotifyParent(CanvasEvent event) const
 {
-	CWnd* const parent = GetParent();
-	if (parent != nullptr && ::IsWindow(parent->GetSafeHwnd()))
+	const HWND parentWindow = ::GetParent(GetSafeHwnd());
+	if (::IsWindow(parentWindow))
 	{
-		parent->SendMessage(WM_APP_CANVAS_EVENT, static_cast<WPARAM>(event), 0);
+		::SendMessage(parentWindow, WM_APP_CANVAS_EVENT,
+			static_cast<WPARAM>(event), 0);
 	}
 }

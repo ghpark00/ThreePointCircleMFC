@@ -47,6 +47,7 @@ private:
 		int maximum, int& value) noexcept;
 	void UpdateCoordinateLabels();
 	void UpdateSettingEdits();
+	void UpdateCanvasStatus();
 	void SetStatusText(const CString& text);
 
 	CCanvasWnd m_canvas;
