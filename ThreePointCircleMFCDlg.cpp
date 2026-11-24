@@ -8,7 +8,84 @@
 #include "ThreePointCircleMFCDlg.h"
 #include "afxdialogex.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <random>
+#include <system_error>
+
+namespace
+{
+	constexpr UINT WM_APP_RANDOM_MOVE_UPDATE = WM_APP + 2;
+	constexpr UINT WM_APP_RANDOM_MOVE_FINISHED = WM_APP + 3;
+	constexpr int kRandomPointGenerationAttempts = 100;
+	constexpr std::chrono::milliseconds kRandomMoveInterval(500);
+
+	struct RandomMovePayload
+	{
+		std::uint64_t runId = 0;
+		int iteration = 0;
+		std::array<CPoint, CCanvasWnd::kMaxPointCount> points{};
+	};
+
+	bool GenerateValidRandomPoints(int width, int height,
+		std::mt19937& generator,
+		std::array<CPoint, CCanvasWnd::kMaxPointCount>& points)
+	{
+		if (width <= 0 || height <= 0)
+		{
+			return false;
+		}
+
+		std::uniform_int_distribution<int> xDistribution(0, width - 1);
+		std::uniform_int_distribution<int> yDistribution(0, height - 1);
+		for (int attempt = 0; attempt < kRandomPointGenerationAttempts; ++attempt)
+		{
+			for (CPoint& point : points)
+			{
+				point.x = xDistribution(generator);
+				point.y = yDistribution(generator);
+			}
+
+			const CircleGeometry::CircumcircleResult result =
+				CircleGeometry::CalculateCircumcircle(
+					{ static_cast<double>(points[0].x), static_cast<double>(points[0].y) },
+					{ static_cast<double>(points[1].x), static_cast<double>(points[1].y) },
+					{ static_cast<double>(points[2].x), static_cast<double>(points[2].y) });
+			if (result.IsValid())
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool PostRandomMoveUpdate(HWND targetWindow,
+		std::unique_ptr<RandomMovePayload> payload) noexcept
+	{
+		RandomMovePayload* rawPayload = payload.release();
+		if (::PostMessage(targetWindow, WM_APP_RANDOM_MOVE_UPDATE, 0,
+			reinterpret_cast<LPARAM>(rawPayload)))
+		{
+			return true;
+		}
+
+		delete rawPayload;
+		return false;
+	}
+
+	void PostRandomMoveFinished(HWND targetWindow, std::uint64_t runId,
+		bool succeeded, int completedIterations) noexcept
+	{
+		const LPARAM result = MAKELPARAM(
+			static_cast<WORD>(completedIterations),
+			static_cast<WORD>(succeeded ? 1 : 0));
+		::PostMessage(targetWindow, WM_APP_RANDOM_MOVE_FINISHED,
+			static_cast<WPARAM>(runId), result);
+	}
+}
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -58,6 +135,16 @@ CThreePointCircleMFCDlg::CThreePointCircleMFCDlg(CWnd* pParent /*=nullptr*/)
 	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
 }
 
+CThreePointCircleMFCDlg::~CThreePointCircleMFCDlg()
+{
+	m_randomMoveCancelRequested.store(true);
+	m_randomMoveCondition.notify_all();
+	if (m_randomMoveThread.joinable())
+	{
+		m_randomMoveThread.join();
+	}
+}
+
 void CThreePointCircleMFCDlg::DoDataExchange(CDataExchange* pDX)
 {
 	CDialogEx::DoDataExchange(pDX);
@@ -67,9 +154,13 @@ BEGIN_MESSAGE_MAP(CThreePointCircleMFCDlg, CDialogEx)
 	ON_WM_SYSCOMMAND()
 	ON_WM_PAINT()
 	ON_WM_QUERYDRAGICON()
+	ON_WM_DESTROY()
 	ON_BN_CLICKED(IDC_BUTTON_APPLY_SETTINGS, &CThreePointCircleMFCDlg::OnBnClickedApplySettings)
 	ON_BN_CLICKED(IDC_BUTTON_RESET, &CThreePointCircleMFCDlg::OnBnClickedReset)
+	ON_BN_CLICKED(IDC_BUTTON_RANDOM_MOVE, &CThreePointCircleMFCDlg::OnBnClickedRandomMove)
 	ON_MESSAGE(WM_APP_CANVAS_EVENT, &CThreePointCircleMFCDlg::OnCanvasEvent)
+	ON_MESSAGE(WM_APP_RANDOM_MOVE_UPDATE, &CThreePointCircleMFCDlg::OnRandomMoveUpdate)
+	ON_MESSAGE(WM_APP_RANDOM_MOVE_FINISHED, &CThreePointCircleMFCDlg::OnRandomMoveFinished)
 END_MESSAGE_MAP()
 
 
@@ -121,6 +212,7 @@ BOOL CThreePointCircleMFCDlg::OnInitDialog()
 	UpdateSettingEdits();
 	UpdateCoordinateLabels();
 	SetStatusText(_T("클릭점 0/3\r\n캔버스를 클릭하세요."));
+	UpdateControlStates();
 
 	return TRUE;  // 포커스를 컨트롤에 설정하지 않으면 TRUE를 반환합니다.
 }
@@ -128,7 +220,10 @@ BOOL CThreePointCircleMFCDlg::OnInitDialog()
 void CThreePointCircleMFCDlg::OnOK()
 {
 	// Enter applies the settings but never closes the dialog unexpectedly.
-	OnBnClickedApplySettings();
+	if (!m_randomMoveRunning)
+	{
+		OnBnClickedApplySettings();
+	}
 }
 
 void CThreePointCircleMFCDlg::OnSysCommand(UINT nID, LPARAM lParam)
@@ -182,6 +277,11 @@ HCURSOR CThreePointCircleMFCDlg::OnQueryDragIcon()
 
 void CThreePointCircleMFCDlg::OnBnClickedApplySettings()
 {
+	if (m_randomMoveRunning || m_isClosing)
+	{
+		return;
+	}
+
 	CString radiusText;
 	CString thicknessText;
 	GetDlgItemText(IDC_EDIT_POINT_RADIUS, radiusText);
@@ -220,6 +320,7 @@ void CThreePointCircleMFCDlg::OnBnClickedApplySettings()
 	if (m_canvas.GetPointCount() == CCanvasWnd::kMaxPointCount)
 	{
 		UpdateCanvasStatus();
+		UpdateControlStates();
 		return;
 	}
 
@@ -227,14 +328,83 @@ void CThreePointCircleMFCDlg::OnBnClickedApplySettings()
 	status.Format(_T("클릭점 %d/3\r\n설정 적용: 반지름 %d, 두께 %d"),
 		m_canvas.GetPointCount(), m_pointRadius, m_outlineThickness);
 	SetStatusText(status);
+	UpdateControlStates();
 }
 
 void CThreePointCircleMFCDlg::OnBnClickedReset()
 {
+	CancelAndJoinRandomMove(true);
 	m_canvas.ResetPoints();
 	UpdateCoordinateLabels();
 	UpdateSettingEdits();
 	SetStatusText(_T("클릭점 0/3\r\n캔버스를 클릭하세요."));
+	UpdateControlStates();
+}
+
+void CThreePointCircleMFCDlg::OnBnClickedRandomMove()
+{
+	if (m_randomMoveRunning || m_isClosing)
+	{
+		return;
+	}
+
+	CircleGeometry::Circumcircle circle;
+	if (m_canvas.GetPointCount() != CCanvasWnd::kMaxPointCount ||
+		!m_canvas.GetCircumcircle(circle))
+	{
+		UpdateControlStates();
+		return;
+	}
+
+	CRect canvasRectangle;
+	m_canvas.GetClientRect(&canvasRectangle);
+	const int canvasWidth = static_cast<int>(canvasRectangle.Width());
+	const int canvasHeight = static_cast<int>(canvasRectangle.Height());
+	if (canvasWidth <= 0 || canvasHeight <= 0)
+	{
+		SetStatusText(_T("랜덤 이동을 시작할 수 없습니다.\r\n캔버스 크기가 올바르지 않습니다."));
+		UpdateControlStates();
+		return;
+	}
+
+	if (m_randomMoveThread.joinable())
+	{
+		m_randomMoveThread.join();
+	}
+
+	++m_activeRandomMoveRunId;
+	m_lastRandomMoveIteration = 0;
+	m_randomMoveCancelRequested.store(false);
+	m_randomMoveRunning = true;
+#ifdef _DEBUG
+	m_randomMoveTimingSampleCount = 0;
+#endif
+	UpdateControlStates();
+	SetStatusText(_T("랜덤 이동 준비 중... 0 / 10"));
+
+	const std::uint64_t runId = m_activeRandomMoveRunId;
+	const HWND targetWindow = GetSafeHwnd();
+	try
+	{
+		m_randomMoveThread = std::thread(
+			&CThreePointCircleMFCDlg::RandomMoveWorker, this,
+			targetWindow, runId, canvasWidth, canvasHeight);
+	}
+	catch (const std::system_error&)
+	{
+		m_randomMoveRunning = false;
+		m_randomMoveCancelRequested.store(true);
+		UpdateControlStates();
+		SetStatusText(_T("랜덤 이동 worker를 시작하지 못했습니다."));
+	}
+}
+
+void CThreePointCircleMFCDlg::OnDestroy()
+{
+	m_isClosing = true;
+	CancelAndJoinRandomMove(true);
+	m_canvas.SetInteractionEnabled(false);
+	CDialogEx::OnDestroy();
 }
 
 LRESULT CThreePointCircleMFCDlg::OnCanvasEvent(WPARAM wParam, LPARAM /*lParam*/)
@@ -244,6 +414,99 @@ LRESULT CThreePointCircleMFCDlg::OnCanvasEvent(WPARAM wParam, LPARAM /*lParam*/)
 	{
 		UpdateCoordinateLabels();
 		UpdateCanvasStatus();
+		UpdateControlStates();
+	}
+	return 0;
+}
+
+LRESULT CThreePointCircleMFCDlg::OnRandomMoveUpdate(
+	WPARAM /*wParam*/, LPARAM lParam)
+{
+	std::unique_ptr<RandomMovePayload> payload(
+		reinterpret_cast<RandomMovePayload*>(lParam));
+	if (!payload || !m_randomMoveRunning ||
+		payload->runId != m_activeRandomMoveRunId ||
+		payload->iteration <= m_lastRandomMoveIteration)
+	{
+		return 0;
+	}
+
+	if (!m_canvas.ApplyPoints(payload->points))
+	{
+		CancelAndJoinRandomMove(true);
+		UpdateControlStates();
+		SetStatusText(_T("랜덤 좌표의 외접원을 계산하지 못했습니다."));
+		return 0;
+	}
+
+	m_lastRandomMoveIteration = payload->iteration;
+#ifdef _DEBUG
+	if (payload->iteration >= 1 &&
+		payload->iteration <= kRandomMoveIterationCount)
+	{
+		m_randomMoveAppliedTimes[
+			static_cast<std::size_t>(payload->iteration - 1)] =
+			std::chrono::steady_clock::now();
+		m_randomMoveTimingSampleCount = payload->iteration;
+	}
+#endif
+	UpdateCoordinateLabels();
+	UpdateRandomMoveStatus(payload->iteration);
+	return 0;
+}
+
+LRESULT CThreePointCircleMFCDlg::OnRandomMoveFinished(
+	WPARAM wParam, LPARAM lParam)
+{
+	const std::uint64_t runId = static_cast<std::uint64_t>(wParam);
+	const int completedIterations = static_cast<int>(LOWORD(lParam));
+	const bool succeeded = HIWORD(lParam) != 0;
+	if (!m_randomMoveRunning || runId != m_activeRandomMoveRunId)
+	{
+		return 0;
+	}
+
+	m_randomMoveCancelRequested.store(true);
+	m_randomMoveCondition.notify_all();
+	if (m_randomMoveThread.joinable())
+	{
+		m_randomMoveThread.join();
+	}
+	m_randomMoveRunning = false;
+	UpdateControlStates();
+
+	if (succeeded && completedIterations == kRandomMoveIterationCount &&
+		m_lastRandomMoveIteration == kRandomMoveIterationCount)
+	{
+		CString status(_T("랜덤 이동 완료 (10 / 10)"));
+#ifdef _DEBUG
+		if (m_randomMoveTimingSampleCount == kRandomMoveIterationCount)
+		{
+			long long minimumInterval = (std::numeric_limits<long long>::max)();
+			long long maximumInterval = 0;
+			for (int index = 1; index < kRandomMoveIterationCount; ++index)
+			{
+				const long long interval = std::chrono::duration_cast<
+					std::chrono::milliseconds>(
+						m_randomMoveAppliedTimes[static_cast<std::size_t>(index)] -
+						m_randomMoveAppliedTimes[static_cast<std::size_t>(index - 1)]).count();
+				minimumInterval = (std::min)(minimumInterval, interval);
+				maximumInterval = (std::max)(maximumInterval, interval);
+			}
+			CString timing;
+			timing.Format(_T("\r\n주기 %lld~%lld ms"),
+				minimumInterval, maximumInterval);
+			status += timing;
+		}
+#endif
+		SetStatusText(status);
+	}
+	else
+	{
+		CString status;
+		status.Format(_T("랜덤 이동 중단 (%d / %d)\r\n유효한 좌표 생성에 실패했습니다."),
+			completedIterations, kRandomMoveIterationCount);
+		SetStatusText(status);
 	}
 	return 0;
 }
@@ -345,6 +608,157 @@ void CThreePointCircleMFCDlg::UpdateCanvasStatus()
 	default:
 		SetStatusText(_T("수치적으로 불안정하여\r\n외접원을 계산할 수 없습니다."));
 		break;
+	}
+}
+
+void CThreePointCircleMFCDlg::UpdateControlStates()
+{
+	const bool idle = !m_randomMoveRunning && !m_isClosing;
+	const HWND dialogWindow = GetSafeHwnd();
+	if (!::IsWindow(dialogWindow))
+	{
+		return;
+	}
+
+	::EnableWindow(::GetDlgItem(dialogWindow, IDC_EDIT_POINT_RADIUS), idle);
+	::EnableWindow(::GetDlgItem(dialogWindow, IDC_EDIT_OUTLINE_THICKNESS), idle);
+	::EnableWindow(::GetDlgItem(dialogWindow, IDC_BUTTON_APPLY_SETTINGS), idle);
+	::EnableWindow(::GetDlgItem(dialogWindow, IDC_BUTTON_RESET), !m_isClosing);
+
+	CircleGeometry::Circumcircle circle;
+	const bool canStartRandomMove = idle &&
+		m_canvas.GetPointCount() == CCanvasWnd::kMaxPointCount &&
+		m_canvas.GetCircumcircle(circle);
+	::EnableWindow(::GetDlgItem(dialogWindow, IDC_BUTTON_RANDOM_MOVE),
+		canStartRandomMove);
+	m_canvas.SetInteractionEnabled(idle);
+}
+
+void CThreePointCircleMFCDlg::UpdateRandomMoveStatus(int iteration)
+{
+	CircleGeometry::Circumcircle circle;
+	CString status;
+	if (m_canvas.GetCircumcircle(circle))
+	{
+		status.Format(_T("랜덤 이동 중... %d / %d\r\n중심 (%.1f, %.1f)"),
+			iteration, kRandomMoveIterationCount,
+			circle.centerX, circle.centerY);
+	}
+	else
+	{
+		status.Format(_T("랜덤 이동 중... %d / %d\r\n외접원 계산 불가"),
+			iteration, kRandomMoveIterationCount);
+	}
+	SetStatusText(status);
+}
+
+void CThreePointCircleMFCDlg::RandomMoveWorker(HWND targetWindow,
+	std::uint64_t runId, int canvasWidth, int canvasHeight) noexcept
+{
+	int completedIterations = 0;
+	try
+	{
+		std::random_device randomDevice;
+		std::seed_seq seed
+		{
+			randomDevice(), randomDevice(), randomDevice(), randomDevice(),
+			static_cast<unsigned int>(runId),
+			static_cast<unsigned int>(runId >> 32)
+		};
+		std::mt19937 generator(seed);
+		auto nextUpdate = std::chrono::steady_clock::now();
+
+		for (int iteration = 1;
+			iteration <= kRandomMoveIterationCount; ++iteration)
+		{
+			nextUpdate += kRandomMoveInterval;
+			std::unique_lock<std::mutex> lock(m_randomMoveWaitMutex);
+			const bool cancelled = m_randomMoveCondition.wait_until(
+				lock, nextUpdate,
+				[this]() { return m_randomMoveCancelRequested.load(); });
+			lock.unlock();
+			if (cancelled || m_randomMoveCancelRequested.load())
+			{
+				return;
+			}
+
+			std::array<CPoint, CCanvasWnd::kMaxPointCount> points{};
+			if (!GenerateValidRandomPoints(
+				canvasWidth, canvasHeight, generator, points))
+			{
+				PostRandomMoveFinished(targetWindow, runId, false,
+					completedIterations);
+				return;
+			}
+			if (m_randomMoveCancelRequested.load())
+			{
+				return;
+			}
+
+			auto payload = std::make_unique<RandomMovePayload>();
+			payload->runId = runId;
+			payload->iteration = iteration;
+			payload->points = points;
+			if (!PostRandomMoveUpdate(targetWindow, std::move(payload)))
+			{
+				PostRandomMoveFinished(targetWindow, runId, false,
+					completedIterations);
+				return;
+			}
+			completedIterations = iteration;
+		}
+
+		if (!m_randomMoveCancelRequested.load())
+		{
+			PostRandomMoveFinished(targetWindow, runId, true,
+				completedIterations);
+		}
+	}
+	catch (...)
+	{
+		if (!m_randomMoveCancelRequested.load())
+		{
+			PostRandomMoveFinished(targetWindow, runId, false,
+				completedIterations);
+		}
+	}
+}
+
+void CThreePointCircleMFCDlg::CancelAndJoinRandomMove(bool invalidateRunId)
+{
+	if (invalidateRunId)
+	{
+		++m_activeRandomMoveRunId;
+	}
+
+	m_randomMoveCancelRequested.store(true);
+	m_randomMoveCondition.notify_all();
+	if (m_randomMoveThread.joinable())
+	{
+		m_randomMoveThread.join();
+	}
+	m_randomMoveRunning = false;
+	m_lastRandomMoveIteration = 0;
+	DrainRandomMoveMessages();
+}
+
+void CThreePointCircleMFCDlg::DrainRandomMoveMessages() noexcept
+{
+	const HWND dialogWindow = GetSafeHwnd();
+	if (!::IsWindow(dialogWindow))
+	{
+		return;
+	}
+
+	MSG message{};
+	while (::PeekMessage(&message, dialogWindow,
+		WM_APP_RANDOM_MOVE_UPDATE, WM_APP_RANDOM_MOVE_UPDATE, PM_REMOVE))
+	{
+		delete reinterpret_cast<RandomMovePayload*>(message.lParam);
+	}
+	while (::PeekMessage(&message, dialogWindow,
+		WM_APP_RANDOM_MOVE_FINISHED, WM_APP_RANDOM_MOVE_FINISHED, PM_REMOVE))
+	{
 	}
 }
 

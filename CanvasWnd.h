@@ -20,6 +20,8 @@ public:
 
 	BOOL AttachCanvas(CWnd* parent, UINT controlId);
 	void SetRenderSettings(int pointRadius, int outlineThickness);
+	void SetInteractionEnabled(bool enabled);
+	bool ApplyPoints(const std::array<CPoint, kMaxPointCount>& points);
 	void ResetPoints();
 
 	int GetPointCount() const noexcept;
@@ -59,4 +61,5 @@ private:
 	int m_outlineThickness = 2;
 	int m_dragPointIndex = -1;
 	bool m_isDragging = false;
+	bool m_interactionEnabled = true;
 };

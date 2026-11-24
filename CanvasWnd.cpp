@@ -50,6 +50,33 @@ void CCanvasWnd::SetRenderSettings(int pointRadius, int outlineThickness)
 	Invalidate(FALSE);
 }
 
+void CCanvasWnd::SetInteractionEnabled(bool enabled)
+{
+	if (m_interactionEnabled == enabled)
+	{
+		return;
+	}
+
+	m_interactionEnabled = enabled;
+	if (!m_interactionEnabled)
+	{
+		EndDrag(true);
+	}
+}
+
+bool CCanvasWnd::ApplyPoints(
+	const std::array<CPoint, kMaxPointCount>& points)
+{
+	EndDrag(true);
+	m_points = points;
+	m_pointCount = kMaxPointCount;
+	RecalculateCircumcircle();
+	RenderScene();
+	Invalidate(FALSE);
+	UpdateWindow();
+	return m_circumcircle.has_value();
+}
+
 void CCanvasWnd::ResetPoints()
 {
 	EndDrag(true);
@@ -117,6 +144,12 @@ BOOL CCanvasWnd::OnEraseBkgnd(CDC* /*dc*/)
 
 void CCanvasWnd::OnLButtonDown(UINT flags, CPoint point)
 {
+	if (!m_interactionEnabled)
+	{
+		CWnd::OnLButtonDown(flags, point);
+		return;
+	}
+
 	::SetFocus(GetSafeHwnd());
 
 	CRect clientRectangle;
