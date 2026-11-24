@@ -245,14 +245,6 @@ LRESULT CThreePointCircleMFCDlg::OnCanvasEvent(WPARAM wParam, LPARAM /*lParam*/)
 		UpdateCoordinateLabels();
 		UpdateCanvasStatus();
 	}
-	else if (event == CanvasEvent::PointLimitReached)
-	{
-		SetStatusText(_T("클릭점 3/3\r\n더 이상 추가할 수 없습니다."));
-	}
-	else if (event == CanvasEvent::ExistingPointPressed)
-	{
-		SetStatusText(_T("클릭점 3/3\r\n드래그는 다음 단계에서 지원합니다."));
-	}
 	return 0;
 }
 

@@ -10,9 +10,7 @@ inline constexpr UINT WM_APP_CANVAS_EVENT = WM_APP + 1;
 
 enum class CanvasEvent
 {
-	PointsChanged = 1,
-	PointLimitReached,
-	ExistingPointPressed
+	PointsChanged = 1
 };
 
 class CCanvasWnd : public CWnd
@@ -33,7 +31,13 @@ protected:
 	afx_msg void OnPaint();
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
 	afx_msg void OnLButtonDown(UINT flags, CPoint point);
+	afx_msg void OnLButtonUp(UINT flags, CPoint point);
+	afx_msg void OnMouseMove(UINT flags, CPoint point);
 	afx_msg void OnSize(UINT type, int cx, int cy);
+	afx_msg void OnCancelMode();
+	afx_msg void OnKeyDown(UINT character, UINT repeatCount, UINT flags);
+	afx_msg void OnNcDestroy();
+	afx_msg LRESULT OnCaptureChanged(WPARAM wParam, LPARAM lParam);
 	DECLARE_MESSAGE_MAP()
 
 private:
@@ -41,6 +45,8 @@ private:
 	void RecalculateCircumcircle();
 	void RenderScene();
 	int HitTestPoint(CPoint point) const noexcept;
+	bool UpdateDraggedPoint(CPoint point);
+	void EndDrag(bool releaseCapture) noexcept;
 	void NotifyParent(CanvasEvent event) const;
 
 	ATL::CImage m_image;
@@ -51,4 +57,6 @@ private:
 	int m_pointCount = 0;
 	int m_pointRadius = 10;
 	int m_outlineThickness = 2;
+	int m_dragPointIndex = -1;
+	bool m_isDragging = false;
 };

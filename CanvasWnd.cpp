@@ -10,7 +10,13 @@ BEGIN_MESSAGE_MAP(CCanvasWnd, CWnd)
 	ON_WM_PAINT()
 	ON_WM_ERASEBKGND()
 	ON_WM_LBUTTONDOWN()
+	ON_WM_LBUTTONUP()
+	ON_WM_MOUSEMOVE()
 	ON_WM_SIZE()
+	ON_WM_CANCELMODE()
+	ON_WM_KEYDOWN()
+	ON_WM_NCDESTROY()
+	ON_MESSAGE(WM_CAPTURECHANGED, &CCanvasWnd::OnCaptureChanged)
 END_MESSAGE_MAP()
 
 BOOL CCanvasWnd::AttachCanvas(CWnd* parent, UINT controlId)
@@ -46,6 +52,7 @@ void CCanvasWnd::SetRenderSettings(int pointRadius, int outlineThickness)
 
 void CCanvasWnd::ResetPoints()
 {
+	EndDrag(true);
 	m_pointCount = 0;
 	m_circumcircle.reset();
 	m_circumcircleError = CircleGeometry::CircumcircleError::None;
@@ -110,7 +117,7 @@ BOOL CCanvasWnd::OnEraseBkgnd(CDC* /*dc*/)
 
 void CCanvasWnd::OnLButtonDown(UINT flags, CPoint point)
 {
-	SetFocus();
+	::SetFocus(GetSafeHwnd());
 
 	CRect clientRectangle;
 	GetClientRect(&clientRectangle);
@@ -120,18 +127,22 @@ void CCanvasWnd::OnLButtonDown(UINT flags, CPoint point)
 		return;
 	}
 
-	// This branch is intentionally separate from the capacity check. The next
-	// stage can start mouse capture here without restructuring the 3-point case.
-	if (m_pointCount == kMaxPointCount && HitTestPoint(point) >= 0)
+	const int hitPointIndex = HitTestPoint(point);
+	if (hitPointIndex >= 0)
 	{
-		NotifyParent(CanvasEvent::ExistingPointPressed);
+		m_dragPointIndex = hitPointIndex;
+		m_isDragging = true;
+		::SetCapture(GetSafeHwnd());
+		if (::GetCapture() != GetSafeHwnd())
+		{
+			EndDrag(false);
+		}
 		CWnd::OnLButtonDown(flags, point);
 		return;
 	}
 
 	if (m_pointCount >= kMaxPointCount)
 	{
-		NotifyParent(CanvasEvent::PointLimitReached);
 		CWnd::OnLButtonDown(flags, point);
 		return;
 	}
@@ -146,6 +157,37 @@ void CCanvasWnd::OnLButtonDown(UINT flags, CPoint point)
 	CWnd::OnLButtonDown(flags, point);
 }
 
+void CCanvasWnd::OnLButtonUp(UINT flags, CPoint point)
+{
+	if (m_isDragging)
+	{
+		if (::GetCapture() == GetSafeHwnd())
+		{
+			UpdateDraggedPoint(point);
+		}
+		EndDrag(true);
+	}
+
+	CWnd::OnLButtonUp(flags, point);
+}
+
+void CCanvasWnd::OnMouseMove(UINT flags, CPoint point)
+{
+	if (m_isDragging)
+	{
+		if (::GetCapture() == GetSafeHwnd())
+		{
+			UpdateDraggedPoint(point);
+		}
+		else
+		{
+			EndDrag(false);
+		}
+	}
+
+	CWnd::OnMouseMove(flags, point);
+}
+
 void CCanvasWnd::OnSize(UINT type, int cx, int cy)
 {
 	CWnd::OnSize(type, cx, cy);
@@ -157,6 +199,35 @@ void CCanvasWnd::OnSize(UINT type, int cx, int cy)
 			Invalidate(FALSE);
 		}
 	}
+}
+
+void CCanvasWnd::OnCancelMode()
+{
+	EndDrag(true);
+	CWnd::OnCancelMode();
+}
+
+void CCanvasWnd::OnKeyDown(UINT character, UINT repeatCount, UINT flags)
+{
+	if (character == VK_ESCAPE && m_isDragging)
+	{
+		EndDrag(true);
+		return;
+	}
+
+	CWnd::OnKeyDown(character, repeatCount, flags);
+}
+
+void CCanvasWnd::OnNcDestroy()
+{
+	EndDrag(true);
+	CWnd::OnNcDestroy();
+}
+
+LRESULT CCanvasWnd::OnCaptureChanged(WPARAM /*wParam*/, LPARAM /*lParam*/)
+{
+	EndDrag(false);
+	return 0;
 }
 
 bool CCanvasWnd::RecreateImage(int width, int height)
@@ -241,19 +312,70 @@ void CCanvasWnd::RenderScene()
 
 int CCanvasWnd::HitTestPoint(CPoint point) const noexcept
 {
+	constexpr int kMinimumHitRadius = 6;
+	const int hitRadius = (std::max)(m_pointRadius, kMinimumHitRadius);
 	const std::int64_t radiusSquared =
-		static_cast<std::int64_t>(m_pointRadius) * m_pointRadius;
-	for (int index = m_pointCount - 1; index >= 0; --index)
+		static_cast<std::int64_t>(hitRadius) * hitRadius;
+	std::int64_t closestDistanceSquared = radiusSquared + 1;
+	int closestPointIndex = -1;
+	for (int index = 0; index < m_pointCount; ++index)
 	{
 		const CPoint& candidate = m_points[static_cast<std::size_t>(index)];
 		const std::int64_t dx = static_cast<std::int64_t>(point.x) - candidate.x;
 		const std::int64_t dy = static_cast<std::int64_t>(point.y) - candidate.y;
-		if (dx * dx + dy * dy <= radiusSquared)
+		const std::int64_t distanceSquared = dx * dx + dy * dy;
+		if (distanceSquared <= radiusSquared &&
+			distanceSquared < closestDistanceSquared)
 		{
-			return index;
+			closestDistanceSquared = distanceSquared;
+			closestPointIndex = index;
 		}
 	}
-	return -1;
+	return closestPointIndex;
+}
+
+bool CCanvasWnd::UpdateDraggedPoint(CPoint point)
+{
+	if (!m_isDragging || m_dragPointIndex < 0 ||
+		m_dragPointIndex >= m_pointCount)
+	{
+		return false;
+	}
+
+	CRect clientRectangle;
+	GetClientRect(&clientRectangle);
+	if (clientRectangle.Width() <= 0 || clientRectangle.Height() <= 0)
+	{
+		return false;
+	}
+
+	const int maximumX = static_cast<int>(clientRectangle.Width()) - 1;
+	const int maximumY = static_cast<int>(clientRectangle.Height()) - 1;
+	point.x = (std::max)(0, (std::min)(static_cast<int>(point.x), maximumX));
+	point.y = (std::max)(0, (std::min)(static_cast<int>(point.y), maximumY));
+	CPoint& draggedPoint = m_points[static_cast<std::size_t>(m_dragPointIndex)];
+	if (draggedPoint == point)
+	{
+		return false;
+	}
+
+	draggedPoint = point;
+	RecalculateCircumcircle();
+	RenderScene();
+	Invalidate(FALSE);
+	UpdateWindow();
+	NotifyParent(CanvasEvent::PointsChanged);
+	return true;
+}
+
+void CCanvasWnd::EndDrag(bool releaseCapture) noexcept
+{
+	m_isDragging = false;
+	m_dragPointIndex = -1;
+	if (releaseCapture && ::GetCapture() == GetSafeHwnd())
+	{
+		::ReleaseCapture();
+	}
 }
 
 void CCanvasWnd::NotifyParent(CanvasEvent event) const
